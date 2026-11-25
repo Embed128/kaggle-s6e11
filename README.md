@@ -8,27 +8,23 @@
 | :--- | :--- | :---: | :---: | :---: |
 | **V1 Baseline** | Raw-24 + LightGBM (`leaves=63`, 5-Fold) | `0.945816` | `0.94637` | `#2354 / 3075` |
 | **V2 Ensemble** | FE v3 (146 维：多尺度数字位 + 严格折内 OOF TE + 14 组交互) + 5-Fold Rank Blend | `0.950693` | `0.95033` | `#1421` |
-| **V3 GPU Suite** | 10-Fold 10 模型异构全家桶（`super_gam`/`lr_gam`/`xgb_d2_gpu`/`lgb_d2`/`tabm_nn`/`cb_gpu`）+ Hill-Climb Log-Odds | `0.950932` | **`0.95051`** | **`#1403`** |
-| **V4 Champion (冲刺 0.9525+)** | **3 变体 Target-First 数字 Token 因果语言模型（`tf_lm_rev`/`fwd`/`disc`，贝叶斯对数似然比）+ RealMLP-PBLD（高频周期嵌入 `sigma=5`）+ 100万行 LOO 无监督簇画像模型 + V3/V4 共 17 模型融合 + Zero-Fraud Zones 1-4** | 待 5060 Ti 跑出 | 待提交 | — |
+| **V3 GPU Suite** | 10-Fold 10 模型自训全家桶（`super_gam`/`lr_gam`/`xgb_d2_gpu`/`lgb_d2`/`tabm_nn`/`cb_gpu`）+ Hill-Climb Log-Odds | `0.950932` | `0.95051` | `#1403` |
+| **V5 Grand Stack (209 异构流)** | 自训模型 + 14 大公开同折 OOF 库（4× 独立 Target-First LM + TabPFN-3.5 + RealMLP-BPE + TabM + EBM + Golem + GBDT/GLM，去重 209 模型）+ 严格 Nested 5-Fold Direct-AUC 剪枝元堆叠 + Zero-Fraud Zones 1–4 | **`0.952593`** *(V5.2)* / **`0.952547`** *(V5.3 精细融合)* | 待提交 | — |
 
 ---
 
-## RTX 5060 Ti Windows 台式机一键开跑 V4
+## 快速复现 V5（含 5060 Ti 10-Fold V3 模型合体）
 
-### 1. 拉取最新代码
 ```powershell
 cd kaggle-s6e11
 git pull
-```
-*(若尚未安装 CUDA 12.8 PyTorch：`uv pip install torch --index-url https://download.pytorch.org/whl/cu128`)*
 
-### 2. 一键运行 V4 全部 GPU 模型 + 自动汇总 V3 & V4 共 17 模型融合
-```powershell
-uv run python src/run_v4_gpu.py
+# 自动下载/复用 14 个公共同折 OOF 库 + 本机全部 V3/V4 自训 OOF，2 分钟生成最终冲榜提交：
+uv run python src/train_v5_3_fine_auc.py
+uv run python src/train_v5_2_auc_stack.py
 ```
 
-#### 运行亮点与贴心机制
-- **按收益从高到低排序**：先跑收益最大的 `tf_lm_rev`（第 1 个 Target-First 因果语言模型），跑完立刻自动生成一份中间融合提交 `submissions/sub_v4_after_lm1.csv`，方便先交一次看大跃进！
-- **逐折断点续跑**：LM 和 RealMLP 每跑完 1 折都会立刻把该折 OOF/Test 存入 `oof/ckpt_v4_*/`，万一中断重跑无缝接续。
-- **自动复用你已跑完的 10 个 V3 OOF**：`src/blend_v4.py` 会把 `oof/oof_v3_*.npy` 和 `oof/oof_v4_*.npy` 全部 17 个模型一起做 10-Fold 严格 Nested-CV 融合，并自动校验 **Zero-Fraud Zones 1–4** 后处理增益。
-- **最终主力提交**：`submissions/sub_v4_champion.csv`（另附不加后处理的 `submissions/sub_v4_raw_best.csv`）。
+### 产出核心提交文件（位于 `submissions/`）
+1. **`sub_v5_2_grand_champion.csv`**：全量 209 流严格 Nested-CV 最高分（OOF **`0.952593`**）
+2. **`sub_v5_3_champion.csv`**：全量 209 流精细多模型混合（`anchor + sameer_glm10f + gb_s4 + lm7 + realmlp_bpe_v2 + gpt2 + tabm`，OOF **`0.952547`**）
+3. **`sub_v5_2_pure_shield.csv`**：纯单模底座（不含任何预融合 anchor，OOF **`0.952104`**，Private LB 抗抖动备用盾牌）

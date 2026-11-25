@@ -332,14 +332,10 @@ def main() -> None:
         torch.manual_seed(SEED + seed_offset + fold)
         np.random.seed(SEED + seed_offset + fold)
 
-        tr_tensor = torch.from_numpy(X_tr_tok[tr_idx].astype(np.int64))
-        tr_loader = DataLoader(
-            TensorDataset(tr_tensor),
-            batch_size=args.batch_size,
-            shuffle=True,
-            drop_last=False,
-            pin_memory=use_amp,
-        )
+        # Keep the compact ~60MB int16 training tensor directly in GPU VRAM to eliminate Windows DataLoader overhead (~10x faster!)
+        tr_gpu = torch.from_numpy(X_tr_tok[tr_idx]).to(device, non_blocking=True)
+        n_tr = tr_gpu.shape[0]
+        steps_per_epoch = math.ceil(n_tr / args.batch_size)
 
         model = TargetFirstTabularLM(
             vocab_size=vocab_size,
@@ -355,7 +351,7 @@ def main() -> None:
             print(f"  Model params: {n_params:.2f}M | d_model={args.d_model}, n_layer={args.n_layer}, mode={args.mode}")
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.05)
-        total_steps = args.epochs * len(tr_loader)
+        total_steps = args.epochs * steps_per_epoch
         warmup_steps = max(1, int(0.08 * total_steps))
 
         def lr_lambda(step: int) -> float:
@@ -378,9 +374,10 @@ def main() -> None:
             model.train()
             loss_sum = 0.0
             n_batches = 0
+            perm = torch.randperm(n_tr, device=device)
 
-            for (bx,) in tr_loader:
-                bx = bx.to(device, non_blocking=True)
+            for start in range(0, n_tr, args.batch_size):
+                bx = tr_gpu[perm[start : start + args.batch_size]].long()
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
@@ -444,7 +441,7 @@ def main() -> None:
         fold_aucs.append(best_auc)
         print(f"  >>> [{model_name}] Fold {fold}/{args.n_folds} BEST AUC = {best_auc:.6f} ({time.time()-ft0:.1f}s)", flush=True)
 
-        del model, optimizer, scheduler, tr_loader, tr_tensor, best_state
+        del model, optimizer, scheduler, tr_gpu, best_state
         gc.collect()
         if use_amp:
             torch.cuda.empty_cache()
