@@ -1,0 +1,20 @@
+[project]
+name = "kaggle-s6e11"
+version = "0.1.0"
+description = "Kaggle Playground Series S6E11 - Predicting Credit Card Fraud"
+requires-python = ">=3.11"
+dependencies = [
+    "kagglehub>=0.3.0",
+    "polars>=1.0.0",
+    "pyarrow>=17.0.0",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "scikit-learn>=1.5.0",
+    "lightgbm>=4.5.0",
+    "xgboost>=2.1.0",
+    "catboost>=1.2.7",
+    "scipy>=1.13.0",
+]
+
+[tool.uv]
+package = false
