@@ -25,8 +25,8 @@ def to_rank(p: np.ndarray) -> np.ndarray:
     return rankdata(p) / len(p)
 
 
-def fast_hill_climb_weights(X_oof: np.ndarray, y: np.ndarray, n_steps: int = 40) -> np.ndarray:
-    """Fast forward hill-climbing (Caruana ensemble selection) — runs in ~1-2s on 560k rows."""
+def fast_hill_climb_weights(X_oof: np.ndarray, y: np.ndarray, n_steps: int = 50) -> np.ndarray:
+    """Fast forward hill-climbing (Caruana ensemble selection) — runs in ~1-2s."""
     n_models = X_oof.shape[1]
     single_aucs = [roc_auc_score(y, X_oof[:, i]) for i in range(n_models)]
     best_idx = int(np.argmax(single_aucs))
@@ -54,10 +54,21 @@ def fast_hill_climb_weights(X_oof: np.ndarray, y: np.ndarray, n_steps: int = 40)
     return counts / counts.sum()
 
 
+def verify_and_save(test_ids: pd.Series, preds: np.ndarray, out_name: str) -> None:
+    sub = pd.DataFrame({ID_COL: test_ids, TARGET_COL: preds})
+    assert len(sub) == len(test_ids), "Row count mismatch!"
+    assert not sub[TARGET_COL].isna().any(), "NaNs found!"
+    assert (sub[TARGET_COL] >= 0).all() and (sub[TARGET_COL] <= 1).all(), "Out of [0,1]!"
+    out_path = SUBMISSION_DIR / out_name
+    sub.to_csv(out_path, index=False)
+    print(f"Saved -> {out_path} (min={preds.min():.6f}, mean={preds.mean():.6f}, max={preds.max():.6f})")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tag", type=str, default="v2")
-    parser.add_argument("--out", type=str, default="sub_v2_ensemble.csv")
+    parser.add_argument("--tag", type=str, default="v3")
+    parser.add_argument("--n-folds", type=int, default=N_FOLDS)
+    parser.add_argument("--out", type=str, default="sub_v3_gpu_ensemble.csv")
     args = parser.parse_args()
 
     train_pl = pl.read_csv(DATA_RAW_DIR / "train.csv", columns=[TARGET_COL])
@@ -70,7 +81,7 @@ def main() -> None:
         raise FileNotFoundError(f"No OOF files matching oof_{args.tag}_*.npy in {OOF_DIR}")
 
     names, oofs, tests = [], [], []
-    print("=== Single Model OOF ROC AUC ===")
+    print(f"=== Single Model OOF ROC AUC (tag={args.tag}) ===")
     for f in oof_files:
         name = f.stem.replace(f"oof_{args.tag}_", "")
         tf = OOF_DIR / f"test_{args.tag}_{name}.npy"
@@ -83,24 +94,19 @@ def main() -> None:
         oofs.append(oof_p)
         tests.append(test_p)
 
-    base_f = OOF_DIR / "oof_lgb_baseline.npy"
-    if base_f.exists():
-        print(f"  {'(ref) baseline':<16} OOF AUC = {roc_auc_score(y, np.load(base_f)):.6f}")
-
     O_logit = np.column_stack([to_logit(p) for p in oofs])
     T_logit = np.column_stack([to_logit(p) for p in tests])
     O_rank = np.column_stack([to_rank(p) for p in oofs])
     T_rank = np.column_stack([to_rank(p) for p in tests])
 
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=SEED)
 
     # 1. Equal Log-Odds Blend
     eq_auc = roc_auc_score(y, O_logit.mean(axis=1))
 
-    # 2. Nested Logistic Regression Stacking (L2-regularized on log-odds, convex & super fast)
+    # 2. Nested Logistic Regression Stacking (L2-regularized on log-odds)
     best_stack_c = 0.05
     best_stack_auc = 0.0
-    best_stack_oof = None
     best_stack_test = None
     best_coefs = None
     for c in [0.005, 0.02, 0.1, 1.0]:
@@ -111,21 +117,20 @@ def main() -> None:
             meta = LogisticRegression(C=c, max_iter=500)
             meta.fit(O_logit[tr_idx], y[tr_idx])
             s_oof[va_idx] = meta.predict_proba(O_logit[va_idx])[:, 1]
-            s_test += meta.predict_proba(T_logit)[:, 1] / N_FOLDS
+            s_test += meta.predict_proba(T_logit)[:, 1] / args.n_folds
             coefs.append(meta.coef_[0])
         auc = roc_auc_score(y, s_oof)
         if auc > best_stack_auc:
             best_stack_auc = auc
             best_stack_c = c
-            best_stack_oof = s_oof
             best_stack_test = s_test
             best_coefs = np.mean(coefs, axis=0)
 
-    # 3. Fast Nested Hill-Climbing on Log-Odds
+    # 3. Strictly Nested Hill-Climbing on Log-Odds
     hc_oof = np.zeros(len(y), dtype=np.float64)
     hc_weights = []
     for tr_idx, va_idx in skf.split(O_logit, y):
-        w = fast_hill_climb_weights(O_logit[tr_idx], y[tr_idx], n_steps=30)
+        w = fast_hill_climb_weights(O_logit[tr_idx], y[tr_idx], n_steps=50)
         hc_weights.append(w)
         hc_oof[va_idx] = O_logit[va_idx] @ w
     avg_w_hc = np.mean(hc_weights, axis=0)
@@ -133,38 +138,40 @@ def main() -> None:
     hc_auc = roc_auc_score(y, hc_oof)
     hc_test = expit(T_logit @ avg_w_hc)
 
-    # 4. Rank Blend using learned hill-climbing weights
-    rank_oof = O_rank @ avg_w_hc
+    # 4. Strictly Nested Rank Blend
+    rank_oof = np.zeros(len(y), dtype=np.float64)
+    rank_weights = []
+    for tr_idx, va_idx in skf.split(O_rank, y):
+        w = fast_hill_climb_weights(O_rank[tr_idx], y[tr_idx], n_steps=50)
+        rank_weights.append(w)
+        rank_oof[va_idx] = O_rank[va_idx] @ w
+    avg_w_rank = np.mean(rank_weights, axis=0)
+    avg_w_rank /= avg_w_rank.sum()
     rank_auc = roc_auc_score(y, rank_oof)
-    rank_test = T_rank @ avg_w_hc
+    rank_test = T_rank @ avg_w_rank
 
     print("\n=== Ensemble Comparison (Strictly Nested-CV Validated) ===")
-    print(f"  1. Equal Log-Odds Blend         OOF AUC = {eq_auc:.6f}")
-    print(f"  2. Hill-Climb Log-Odds Blend    OOF AUC = {hc_auc:.6f}")
+    print(f"  1. Equal Log-Odds Blend          OOF AUC = {eq_auc:.6f}")
+    print(f"  2. Hill-Climb Log-Odds Blend     OOF AUC = {hc_auc:.6f}")
     print(f"  3. Logistic Meta-Stacking(C={best_stack_c}) OOF AUC = {best_stack_auc:.6f}")
-    print(f"  4. Rank Blend (HC weights)      OOF AUC = {rank_auc:.6f}")
+    print(f"  4. Hill-Climb Rank Blend         OOF AUC = {rank_auc:.6f}")
 
     print("\nLearned Weights:")
-    for n, wh, wc in zip(names, avg_w_hc, best_coefs):
-        print(f"  {n:<16} hill_climb={wh:.4f} | stack_coef={wc:+.4f}")
+    for n, wh, wr, wc in zip(names, avg_w_hc, avg_w_rank, best_coefs):
+        print(f"  {n:<16} logit_hc={wh:.4f} | rank_hc={wr:.4f} | stack_coef={wc:+.4f}")
+
+    # Save BOTH calibrated Log-Odds and Rank variants so we can test/compare cleanly on LB!
+    verify_and_save(test_ids, hc_test, f"sub_{args.tag}_logodds.csv")
+    verify_and_save(test_ids, rank_test, f"sub_{args.tag}_rank.csv")
 
     candidates = [
         ("Hill-Climb Log-Odds Blend", hc_auc, hc_test),
         (f"Logistic Meta-Stacking (C={best_stack_c})", best_stack_auc, best_stack_test),
-        ("Rank Blend", rank_auc, rank_test),
+        ("Hill-Climb Rank Blend", rank_auc, rank_test),
     ]
     best_method, best_auc, best_test = max(candidates, key=lambda x: x[1])
-    print(f"\n>>> Selected Ensemble: {best_method} (Nested OOF AUC = {best_auc:.6f})")
-
-    sub = pd.DataFrame({ID_COL: test_ids, TARGET_COL: best_test})
-    assert len(sub) == len(test_ids), "Row count mismatch!"
-    assert not sub[TARGET_COL].isna().any(), "NaNs found!"
-    assert (sub[TARGET_COL] >= 0).all() and (sub[TARGET_COL] <= 1).all(), "Out of [0,1]!"
-
-    out_path = SUBMISSION_DIR / args.out
-    sub.to_csv(out_path, index=False)
-    print(f"Saved submission -> {out_path}")
-    print(f"Stats: min={best_test.min():.6f}, mean={best_test.mean():.6f}, max={best_test.max():.6f}")
+    print(f"\n>>> Selected Best Ensemble: {best_method} (Nested OOF AUC = {best_auc:.6f})")
+    verify_and_save(test_ids, best_test, args.out)
 
 
 if __name__ == "__main__":

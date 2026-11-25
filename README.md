@@ -4,53 +4,48 @@
 
 ## 当前进度记录
 
-| 版本 | 方案摘要 | 本地 5-Fold OOF AUC | Public LB | 排名 |
+| 版本 | 方案摘要 | 本地 OOF AUC | Public LB | 排名 |
 | :--- | :--- | :---: | :---: | :---: |
-| **V1 Baseline** | Raw-24 + LightGBM (`leaves=63`) | `0.945816` | `0.94637` | `#2354 / 3075` |
-| **V2 Ensemble** | FE v3 (146 维：多尺度数字/小数位 + 严格折内贝叶斯平滑 OOF TE + 14 组强交互 TE) + 8 模型评估 + Rank Blend (`lr_gam` + `super_gam` + `xgb_d2` + `lgb_d2`) | `0.950693` | **`0.95033`** | **`#1421`** |
+| **V1 Baseline** | Raw-24 + LightGBM (`leaves=63`, 5-Fold) | `0.945816` | `0.94637` | `#2354 / 3075` |
+| **V2 Ensemble** | FE v3 (146 维：多尺度数字/小数位 + 严格折内 OOF TE + 14 组交互 TE) + 5-Fold Rank Blend | `0.950693` | **`0.95033`** | **`#1421`** |
+| **V3 GPU Suite** | 10-Fold 10 模型真异构全家桶（`lr_gam` + `super_gam` + `lgb_d1/d2/d3_et` + **CUDA XGBoost d2/d3** + **CUDA CatBoost d3/d4** + **PyTorch CUDA TabM BatchEnsemble NN**）+ 严格 Nested-CV 融合 | 待 5060 Ti 跑出 | 待提交 | — |
 
-## 目录结构
+---
 
-```text
-kaggle-s6e11/
-├── pyproject.toml          # uv 依赖配置
-├── uv.lock                 # 精确依赖锁文件
-├── data/raw/               # 原始赛题 CSV（git ignored）
-├── oof/                    # OOF 与测试集预测 .npy（git ignored）
-├── submissions/            # 生成的提交文件 .csv（git ignored）
-└── src/
-    ├── config.py           # 路径与全局超参
-    ├── download_data.py    # 通过 kagglehub 下载并整理数据
-    ├── eda.py              # Polars 高速探索性数据分析
-    ├── features.py         # FE v3（数字/小数位 + 严格防泄露折内 OOF TE）
-    ├── train_lgb.py        # V1 LightGBM Baseline
-    ├── train_v2.py         # 多模型统一训练器（支持 --device cpu|cuda 与 --n-folds）
-    ├── train_super_gam.py  # 多尺度平滑 Super GAM + 2 层神经网络 MLP
-    ├── train_sparse_gam.py # 62k 维稀疏 One-Hot GAM
-    └── blend.py            # 严格 Nested-CV 融合优化（Log-Odds / Stacking / Rank）
-```
+## RTX 5060 Ti Windows 台式机一键开跑 V3
 
-## 在 5060 Ti Windows 台式机上快速开跑
-
-### 1. 环境准备
+### 1. 拉取代码 & 安装基础依赖
 ```powershell
-# 克隆仓库后进入目录
+git clone https://github.com/Embed128/kaggle-s6e11.git
+cd kaggle-s6e11
+# 如果已有仓库，改用：git pull
+
 uv sync
 ```
-配置 Kaggle API Token（写入 `%USERPROFILE%\.kaggle\access_token` 或设置环境变量 `KAGGLE_API_TOKEN`），然后下载数据：
+
+### 2. （推荐）安装 PyTorch CUDA 12.8+ 以启用 5060 Ti TabM 深度网络
+RTX 5060 Ti 为 Blackwell (`sm_120`) 架构，安装 `cu128` 版 PyTorch：
 ```powershell
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+```
+*(如果暂不装 PyTorch，`run_v3_gpu.py` 也会自动优雅跳过 NN 并跑完其余 9 个 GPU/CPU 模型。)*
+
+### 3. 配置 Kaggle API Token 并下载数据（首次执行一次）
+```powershell
+mkdir $HOME\.kaggle -Force
+Set-Content -Path $HOME\.kaggle\access_token -Value "你的KGAT_token" -NoNewline
 uv run python src/download_data.py
 ```
 
-### 2. 开启 CUDA GPU 跑全量模型（推荐 10-Fold）
+### 4. 一键运行 V3 全部 10-Fold GPU 训练 + 自动融合
 ```powershell
-# 跑全部 6 个模型（XGBoost & CatBoost 自动走 5060 Ti CUDA GPU）
-uv run python src/train_v2.py --models lr_gam,lgb_d1,lgb_d2,xgb_d1,xgb_d2,cb_d2 --device cuda --n-folds 10
-
-# 跑 Super GAM + MLP（5-Fold，如需 10-Fold 可在 config.py 将 N_FOLDS 改为 10）
-uv run python src/train_super_gam.py
-
-# 自动融合并生成提交文件
-uv run python src/blend.py --tag f10 --out sub_v3_f10_ensemble.csv
+uv run python src/run_v3_gpu.py
 ```
-*(若只跑 5-Fold，把 `--n-folds 10` 去掉、最后 `--tag` 改为 `v2` 即可。)*
+- **断点续跑**：每个模型跑完都会把 OOF 和测试预测存入 `oof/oof_v3_<model>.npy`，万一中途中断，再次运行 `uv run python src/run_v3_gpu.py` 会自动跳过已完成的模型！
+- **16GB 内存保护**：全程 `Polars + float32` 并在每折后主动 `gc.collect()` 与清理显存。
+- **产出文件**（在 `submissions/` 下）：
+  - `sub_v3_gpu_ensemble.csv`（Nested-CV 最优融合主力提交）
+  - `sub_v3_logodds.csv`（概率校准版 Log-Odds 融合）
+  - `sub_v3_rank.csv`（排序融合版）
+
+跑完后把终端最后 `=== Single Model OOF ROC AUC ===` 到 `>>> Selected Best Ensemble` 之间的输出贴回给架构端，即可继续迭代 V4！
