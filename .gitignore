@@ -5,6 +5,7 @@ __pycache__/
 catboost_info/
 data/raw/
 data/processed/
+data/kernel_outputs/
 oof/
 submissions/
 models/
